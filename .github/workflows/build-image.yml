@@ -1,0 +1,52 @@
+name: Build & push image
+
+# Builds the ms-365-mcp-server Docker image and publishes it to GHCR
+# (ghcr.io/<owner>/ms-365-mcp-server) on every push to the local-front-auth
+# branch and on manual dispatch. The image is tagged with both the short
+# commit SHA and the branch name, so docker-compose can pin a specific
+# build or just track the latest.
+
+on:
+  push:
+    branches:
+      - local-front-auth
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase repo owner
+        id: repo
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.owner }}/ms-365-mcp-server:local-front-auth
+            ghcr.io/${{ steps.repo.outputs.owner }}/ms-365-mcp-server:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

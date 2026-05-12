@@ -431,6 +431,48 @@ class AuthManager {
     return accounts[0];
   }
 
+  /**
+   * Exchanges an OAuth authorization code for tokens via MSAL.
+   *
+   * Used by the HTTP /token endpoint in local front-auth mode to populate the
+   * MSAL token cache (including the Microsoft refresh token) without exposing
+   * the resulting Microsoft access token to the MCP client.
+   *
+   * @returns The account info (homeAccountId, username, …) for the signed-in user.
+   */
+  async acquireTokenByCode(args: {
+    code: string;
+    redirectUri: string;
+    codeVerifier?: string;
+    scopes?: string[];
+  }): Promise<AccountInfo> {
+    const requestScopes = args.scopes ?? this.scopes;
+    const response = await this.msalApp.acquireTokenByCode({
+      code: args.code,
+      redirectUri: args.redirectUri,
+      scopes: requestScopes,
+      codeVerifier: args.codeVerifier,
+    });
+
+    if (!response?.account) {
+      throw new Error('Authorization code exchange did not yield an account');
+    }
+
+    this.accessToken = response.accessToken || null;
+    this.tokenExpiry = response.expiresOn ? new Date(response.expiresOn).getTime() : null;
+
+    // Auto-select this account if none is currently selected so subsequent
+    // silent token acquisitions resolve to the right MSAL entry.
+    if (!this.selectedAccountId) {
+      this.selectedAccountId = response.account.homeAccountId;
+      await this.saveSelectedAccount();
+      logger.info(`Auto-selected account after code exchange: ${response.account.username}`);
+    }
+
+    await this.saveTokenCache();
+    return response.account;
+  }
+
   async acquireTokenByDeviceCode(hack?: (message: string) => void): Promise<string | null> {
     const deviceCodeRequest = {
       scopes: this.scopes,

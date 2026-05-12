@@ -1,6 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import logger from '../logger.js';
 import { getCloudEndpoints, type CloudType } from '../cloud-config.js';
+import {
+  LocalTokenError,
+  verifyLocalToken,
+  type LocalTokenPayload,
+} from './local-tokens.js';
 
 function buildWwwAuthenticate(req: Request, error: string, description: string): string {
   const protocol = req.secure ? 'https' : 'http';
@@ -66,6 +71,51 @@ export const microsoftBearerTokenAuthMiddleware = (
   req.microsoftAuth = { accessToken };
 
   next();
+};
+
+/**
+ * Local-mode bearer middleware: validates that the Authorization header carries
+ * a valid server-issued local access token (HS256, type=access). On success,
+ * attaches the verified payload as `req.localAuth` so downstream handlers know
+ * the subject (homeAccountId) but never see a Microsoft access token.
+ */
+export const localBearerTokenAuthMiddleware = (
+  req: Request & { localAuth?: LocalTokenPayload },
+  res: Response,
+  next: NextFunction
+): void => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res
+      .status(401)
+      .set(
+        'WWW-Authenticate',
+        buildWwwAuthenticate(req, 'invalid_token', 'Missing or malformed Authorization header')
+      )
+      .json({
+        error: 'invalid_token',
+        error_description: 'Missing or malformed Authorization header',
+      });
+    return;
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = verifyLocalToken(token, undefined, { expectedType: 'access' });
+    req.localAuth = payload;
+    next();
+  } catch (error) {
+    const code = error instanceof LocalTokenError ? error.code : 'invalid';
+    const status = code === 'expired' ? 401 : 401;
+    const description = code === 'expired' ? 'The access token has expired' : 'Invalid access token';
+    logger.warn(`Local bearer rejected: ${code}`);
+    res
+      .status(status)
+      .set('WWW-Authenticate', buildWwwAuthenticate(req, 'invalid_token', description))
+      .json({ error: 'invalid_token', error_description: description });
+  }
 };
 
 /**

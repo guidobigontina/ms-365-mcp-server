@@ -12,6 +12,7 @@ import AuthManager, { buildScopesFromEndpoints } from './auth.js';
 import { MicrosoftOAuthProvider } from './oauth-provider.js';
 import {
   exchangeCodeForToken,
+  localBearerTokenAuthMiddleware,
   microsoftBearerTokenAuthMiddleware,
   refreshAccessToken,
 } from './lib/microsoft-auth.js';
@@ -22,6 +23,31 @@ import { getCloudEndpoints } from './cloud-config.js';
 import { requestContext } from './request-context.js';
 import crypto from 'node:crypto';
 import OboClient from './obo-client.js';
+import {
+  LocalTokenError,
+  issueLocalToken,
+  resolveSigningSecret,
+  resolveTtlSeconds,
+  verifyLocalToken,
+  type LocalTokenPayload,
+} from './lib/local-tokens.js';
+
+export type FrontAuthMode = 'microsoft' | 'local';
+
+/**
+ * Reads MS365_MCP_FRONT_AUTH_MODE env var. Default is 'microsoft' (preserves
+ * existing behavior). Any unrecognized value falls back to 'microsoft' with a
+ * warning so a typo cannot silently disable Microsoft auth checks.
+ */
+export function resolveFrontAuthMode(): FrontAuthMode {
+  const raw = process.env.MS365_MCP_FRONT_AUTH_MODE?.trim().toLowerCase();
+  if (!raw || raw === 'microsoft') return 'microsoft';
+  if (raw === 'local') return 'local';
+  logger.warn(
+    `Unrecognized MS365_MCP_FRONT_AUTH_MODE=${raw}; falling back to 'microsoft' to preserve safety`
+  );
+  return 'microsoft';
+}
 
 /**
  * Parse HTTP option into host and port components.
@@ -216,6 +242,19 @@ class MicrosoftGraphServer {
 
         next();
       });
+
+      const frontAuthMode = resolveFrontAuthMode();
+      const localTokenTtlSeconds = resolveTtlSeconds();
+      if (frontAuthMode === 'local') {
+        // Touch the signing secret early so the ephemeral-secret warning fires
+        // at startup, not on the first /token request.
+        resolveSigningSecret();
+        logger.info(
+          `Front-auth mode: LOCAL (server-issued tokens, TTL=${localTokenTtlSeconds}s). MCP clients receive locally signed bearer tokens; Microsoft tokens stay in the MSAL cache.`
+        );
+      } else {
+        logger.info('Front-auth mode: MICROSOFT (default — Graph access tokens flow through)');
+      }
 
       const oauthProvider = new MicrosoftOAuthProvider(this.authManager, this.secrets!);
 
@@ -501,6 +540,7 @@ class MicrosoftGraphServer {
               clientId,
               tenantId,
               hasClientSecret: !!clientSecret,
+              frontAuthMode,
             });
 
             // Two-leg PKCE: check if we have a stored PKCE mapping for this exchange
@@ -530,20 +570,106 @@ class MicrosoftGraphServer {
               }
             }
 
-            const result = await exchangeCodeForToken(
-              body.code as string,
-              body.redirect_uri as string,
-              clientId,
-              clientSecret,
-              tenantId,
-              serverCodeVerifier || (body.code_verifier as string | undefined),
-              this.secrets!.cloudType
-            );
-            res.json(result);
+            if (frontAuthMode === 'local') {
+              // Local mode: exchange the code via MSAL so the Microsoft refresh
+              // token lands in the persistent cache, then issue a server-signed
+              // local token to the MCP client. The Microsoft access token is
+              // intentionally not returned.
+              const codeVerifier =
+                serverCodeVerifier || (body.code_verifier as string | undefined);
+              const account = await this.authManager.acquireTokenByCode({
+                code: body.code as string,
+                redirectUri: body.redirect_uri as string,
+                codeVerifier,
+              });
+
+              const accessToken = issueLocalToken({
+                subject: account.homeAccountId,
+                type: 'access',
+                ttlSeconds: localTokenTtlSeconds,
+              });
+              // Refresh token TTL: at least the access TTL, and a sensible
+              // minimum (30 days or access TTL, whichever is larger) so clients
+              // don't have to re-auth every week.
+              const refreshTtl = Math.max(localTokenTtlSeconds, 30 * 24 * 60 * 60);
+              const refreshToken = issueLocalToken({
+                subject: account.homeAccountId,
+                type: 'refresh',
+                ttlSeconds: refreshTtl,
+              });
+
+              logger.info('Issued local access token for account (token redacted)', {
+                hasAccount: !!account.homeAccountId,
+                ttl: localTokenTtlSeconds,
+              });
+
+              res.json({
+                access_token: accessToken,
+                token_type: 'Bearer',
+                expires_in: localTokenTtlSeconds,
+                refresh_token: refreshToken,
+                scope: '',
+              });
+            } else {
+              const result = await exchangeCodeForToken(
+                body.code as string,
+                body.redirect_uri as string,
+                clientId,
+                clientSecret,
+                tenantId,
+                serverCodeVerifier || (body.code_verifier as string | undefined),
+                this.secrets!.cloudType
+              );
+              res.json(result);
+            }
           } else if (body.grant_type === 'refresh_token') {
             const tenantId = this.secrets?.tenantId || 'common';
             const clientId = this.secrets!.clientId;
             const clientSecret = this.secrets?.clientSecret;
+
+            if (frontAuthMode === 'local') {
+              // Verify the client's refresh token was issued by us, then mint a
+              // new pair. We deliberately do NOT touch Microsoft here: the MSAL
+              // cache holds the Microsoft refresh token used by GraphClient.
+              try {
+                const payload = verifyLocalToken(body.refresh_token as string, undefined, {
+                  expectedType: 'refresh',
+                });
+
+                const accessToken = issueLocalToken({
+                  subject: payload.sub,
+                  type: 'access',
+                  ttlSeconds: localTokenTtlSeconds,
+                });
+                const refreshTtl = Math.max(localTokenTtlSeconds, 30 * 24 * 60 * 60);
+                const newRefreshToken = issueLocalToken({
+                  subject: payload.sub,
+                  type: 'refresh',
+                  ttlSeconds: refreshTtl,
+                });
+
+                logger.info('Refreshed local access token (token redacted)', {
+                  ttl: localTokenTtlSeconds,
+                });
+
+                res.json({
+                  access_token: accessToken,
+                  token_type: 'Bearer',
+                  expires_in: localTokenTtlSeconds,
+                  refresh_token: newRefreshToken,
+                  scope: '',
+                });
+              } catch (error) {
+                const code =
+                  error instanceof LocalTokenError ? error.code : 'invalid_grant';
+                logger.warn(`Local refresh token rejected: ${code}`);
+                res.status(400).json({
+                  error: 'invalid_grant',
+                  error_description: 'Refresh token is invalid or expired',
+                });
+              }
+              return;
+            }
 
             // Log whether using public or confidential client
             if (clientSecret) {
@@ -584,10 +710,26 @@ class MicrosoftGraphServer {
 
       // Microsoft Graph MCP endpoints with bearer token auth
       // Handle both GET and POST methods as required by MCP Streamable HTTP specification
-      app.get(
-        '/mcp',
-        microsoftBearerTokenAuthMiddleware,
-        async (req: Request & { microsoftAuth?: { accessToken: string } }, res: Response) => {
+      //
+      // Middleware choice depends on MS365_MCP_FRONT_AUTH_MODE:
+      //   - 'microsoft' (default): tokens flow through; bearer is a Graph token.
+      //   - 'local': bearer is verified as a server-issued local JWT, and the
+      //     Microsoft token is fetched from the MSAL cache inside GraphClient.
+      const bearerMiddleware =
+        frontAuthMode === 'local'
+          ? localBearerTokenAuthMiddleware
+          : microsoftBearerTokenAuthMiddleware;
+
+      const mcpHandler = (
+        kind: 'GET' | 'POST'
+      ) =>
+        async (
+          req: Request & {
+            microsoftAuth?: { accessToken: string };
+            localAuth?: LocalTokenPayload;
+          },
+          res: Response
+        ) => {
           const handler = async () => {
             const server = this.createMcpServer();
             const transport = new StreamableHTTPServerTransport({
@@ -600,11 +742,21 @@ class MicrosoftGraphServer {
             });
 
             await server.connect(transport);
-            await transport.handleRequest(req as any, res as any, undefined);
+            await transport.handleRequest(
+              req as any,
+              res as any,
+              kind === 'POST' ? req.body : undefined
+            );
           };
 
           try {
-            if (req.microsoftAuth) {
+            if (frontAuthMode === 'local') {
+              // The local bearer has already been verified by the middleware.
+              // Intentionally do NOT put the local token (or any Microsoft
+              // token) into requestContext: GraphClient will fall through to
+              // AuthManager.getToken(), which reads the persistent MSAL cache.
+              await handler();
+            } else if (req.microsoftAuth) {
               let accessToken = req.microsoftAuth.accessToken;
               if (this.oboClient) {
                 accessToken = await this.oboClient.exchangeToken(accessToken);
@@ -614,7 +766,7 @@ class MicrosoftGraphServer {
               await handler();
             }
           } catch (error) {
-            logger.error('Error handling MCP GET request:', error);
+            logger.error(`Error handling MCP ${kind} request:`, error);
             if (!res.headersSent) {
               res.status(500).json({
                 jsonrpc: '2.0',
@@ -626,53 +778,10 @@ class MicrosoftGraphServer {
               });
             }
           }
-        }
-      );
+        };
 
-      app.post(
-        '/mcp',
-        microsoftBearerTokenAuthMiddleware,
-        async (req: Request & { microsoftAuth?: { accessToken: string } }, res: Response) => {
-          const handler = async () => {
-            const server = this.createMcpServer();
-            const transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: undefined, // Stateless mode
-            });
-
-            res.on('close', () => {
-              transport.close();
-              server.close();
-            });
-
-            await server.connect(transport);
-            await transport.handleRequest(req as any, res as any, req.body);
-          };
-
-          try {
-            if (req.microsoftAuth) {
-              let accessToken = req.microsoftAuth.accessToken;
-              if (this.oboClient) {
-                accessToken = await this.oboClient.exchangeToken(accessToken);
-              }
-              await requestContext.run({ accessToken }, handler);
-            } else {
-              await handler();
-            }
-          } catch (error) {
-            logger.error('Error handling MCP POST request:', error);
-            if (!res.headersSent) {
-              res.status(500).json({
-                jsonrpc: '2.0',
-                error: {
-                  code: -32603,
-                  message: 'Internal server error',
-                },
-                id: null,
-              });
-            }
-          }
-        }
-      );
+      app.get('/mcp', bearerMiddleware, mcpHandler('GET'));
+      app.post('/mcp', bearerMiddleware, mcpHandler('POST'));
 
       // Health check endpoint
       app.get('/', (req, res) => {

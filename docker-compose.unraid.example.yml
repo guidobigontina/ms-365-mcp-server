@@ -1,0 +1,59 @@
+# Example docker-compose for Unraid using your fork's image from GHCR.
+#
+# Replaces the older `image: node:20-alpine` + `npx @softeria/ms-365-mcp-server`
+# pattern: the image now contains the pre-built modified server, so cold-starts
+# don't have to fetch + build anything from npm.
+#
+# Before deploying:
+#   1. Push branch `local-front-auth` to your fork so GitHub Actions builds the
+#      image at ghcr.io/guidobigontina/ms-365-mcp-server:local-front-auth
+#   2. If the image is private (GHCR default), either make it public
+#      (Packages → ms-365-mcp-server → Settings → Change visibility → Public)
+#      OR `docker login ghcr.io` on Unraid with a PAT.
+#   3. Generate a strong signing secret on your workstation, NOT in this file:
+#         openssl rand -hex 48     # or: powershell: [Convert]::ToBase64String([Guid]::NewGuid().ToByteArray())x2
+#      Put it into Unraid's "Variable" UI (or a .env file beside this compose),
+#      NEVER commit it.
+
+services:
+  ms365-mcp:
+    image: ghcr.io/guidobigontina/ms-365-mcp-server:local-front-auth
+    container_name: ms365-mcp
+    restart: unless-stopped
+    command:
+      - --http
+      - "3000"
+      - --public-url
+      - https://mcp.exassistai.com
+      - -v
+      - --preset
+      - personal
+      - --toon
+    ports:
+      - "3000:3000"
+    environment:
+      # ── new (local front-auth) ──────────────────────────────────────────
+      MS365_MCP_FRONT_AUTH_MODE: local
+      # KEEP STABLE across restarts — changing it invalidates every issued token.
+      # Provided via Unraid env / .env file. Required: at least 32 chars; 64+ recommended.
+      MS365_MCP_LOCAL_TOKEN_SECRET: ${MS365_MCP_LOCAL_TOKEN_SECRET:?set a strong random value}
+      MS365_MCP_FRONT_TOKEN_TTL_SECONDS: "604800"
+
+      # ── Azure app registration ──────────────────────────────────────────
+      MS365_MCP_CLIENT_ID: ${MS365_MCP_CLIENT_ID:?set Azure app client id}
+      MS365_MCP_TENANT_ID: common
+      # NOTE: rotate the secret you pasted in chat earlier before using it here.
+      MS365_MCP_CLIENT_SECRET: ${MS365_MCP_CLIENT_SECRET:?set Azure app client secret}
+
+      # ── MSAL cache persistence (critical: refresh token lives here) ─────
+      MS365_MCP_TOKEN_CACHE_PATH: /data/ms365-mcp/token-cache.json
+      MS365_MCP_SELECTED_ACCOUNT_PATH: /data/ms365-mcp/selected-account.json
+
+      # ── misc ────────────────────────────────────────────────────────────
+      MS365_MCP_MAX_TOP: "20"
+      # Restrict where /authorize can redirect to (mirror your Azure app reg):
+      # MS365_MCP_ALLOWED_REDIRECT_URIS: https://your-mcp-client.tld/callback
+      # If your MCP client is on a different origin:
+      # MS365_MCP_CORS_ORIGIN: https://your-mcp-client.tld
+    volumes:
+      - /mnt/user/appdata/ms365-mcp-guido:/data/ms365-mcp
