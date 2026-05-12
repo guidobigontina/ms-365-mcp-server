@@ -1,5 +1,5 @@
 import type { AccountInfo, Configuration } from '@azure/msal-node';
-import { PublicClientApplication } from '@azure/msal-node';
+import { ConfidentialClientApplication, PublicClientApplication } from '@azure/msal-node';
 import logger from './logger.js';
 import fs, { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -122,6 +122,10 @@ function pickNewest(
 /**
  * Creates MSAL configuration from secrets.
  * This is called during AuthManager initialization.
+ *
+ * When a client secret is present, the config carries it through to MSAL so a
+ * `ConfidentialClientApplication` can authenticate at the token endpoint —
+ * required for Azure app registrations that don't allow public-client flows.
  */
 function createMsalConfig(secrets: AppSecrets): Configuration {
   const cloudEndpoints = getCloudEndpoints(secrets.cloudType);
@@ -129,6 +133,7 @@ function createMsalConfig(secrets: AppSecrets): Configuration {
     auth: {
       clientId: secrets.clientId || getDefaultClientId(secrets.cloudType),
       authority: `${cloudEndpoints.authority}/${secrets.tenantId || 'common'}`,
+      ...(secrets.clientSecret ? { clientSecret: secrets.clientSecret } : {}),
     },
   };
 }
@@ -222,7 +227,12 @@ interface LoginTestResult {
 class AuthManager {
   private config: Configuration;
   private scopes: string[];
-  private msalApp: PublicClientApplication;
+  // When config.auth.clientSecret is present, msalApp is a
+  // ConfidentialClientApplication (required for Azure app regs that disallow
+  // public client flows — Microsoft will reject acquireTokenByCode /
+  // acquireTokenSilent without the secret with AADSTS70002). Otherwise it's a
+  // PublicClientApplication so the public/PKCE-only flows still work.
+  private msalApp: PublicClientApplication | ConfidentialClientApplication;
   private accessToken: string | null;
   private tokenExpiry: number | null;
   private oauthToken: string | null;
@@ -234,7 +244,9 @@ class AuthManager {
     logger.info(`And scopes are ${scopes.join(', ')}`, scopes);
     this.config = config;
     this.scopes = scopes;
-    this.msalApp = new PublicClientApplication(this.config);
+    this.msalApp = config.auth.clientSecret
+      ? new ConfidentialClientApplication(this.config)
+      : new PublicClientApplication(this.config);
     this.accessToken = null;
     this.tokenExpiry = null;
     this.selectedAccountId = null;
@@ -474,6 +486,11 @@ class AuthManager {
   }
 
   async acquireTokenByDeviceCode(hack?: (message: string) => void): Promise<string | null> {
+    if (!(this.msalApp instanceof PublicClientApplication)) {
+      throw new Error(
+        'Device code flow is only supported for public clients. Unset MS365_MCP_CLIENT_SECRET to use --login.'
+      );
+    }
     const deviceCodeRequest = {
       scopes: this.scopes,
       deviceCodeCallback: (response: { message: string }) => {
@@ -520,6 +537,11 @@ class AuthManager {
   }
 
   async acquireTokenInteractive(hack?: (message: string) => void): Promise<string | null> {
+    if (!(this.msalApp instanceof PublicClientApplication)) {
+      throw new Error(
+        'Interactive browser flow is only supported for public clients. Unset MS365_MCP_CLIENT_SECRET to use --auth-browser.'
+      );
+    }
     const open = (await import('open')).default;
 
     const interactiveRequest = {
